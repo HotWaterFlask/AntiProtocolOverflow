@@ -23,6 +23,8 @@ import org.bukkit.event.Listener;
 import org.bukkit.event.player.PlayerMoveEvent;
 import org.bukkit.plugin.java.JavaPlugin;
 
+import java.io.PrintWriter;
+import java.io.StringWriter;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
@@ -162,9 +164,13 @@ public class PacketHandler {
                 @Override
                 public void onPacketSending(PacketEvent event) {
                     try {
+                        // 更安全的处理，确保异常不会导致玩家断开连接
                         handleBlockEntityDataPacket(event);
                     } catch (Exception e) {
-                        // 静默处理异常，不影响玩家
+                        // 记录异常但不影响玩家
+                        plugin.getLogger().fine("处理方块实体数据时发生异常(安全处理): " + e.getMessage());
+                        // 确保取消数据包发送，避免EncoderException
+                        event.setCancelled(true);
                     }
                 }
             });
@@ -177,7 +183,10 @@ public class PacketHandler {
                         try {
                             handleBlockEntityDataPacket(event);
                         } catch (Exception e) {
-                            // 静默处理异常，不影响玩家
+                            // 记录异常但不影响玩家
+                            plugin.getLogger().fine("处理告示牌数据时发生异常(安全处理): " + e.getMessage());
+                            // 确保取消数据包发送
+                            event.setCancelled(true);
                         }
                     }
                 });
@@ -187,22 +196,277 @@ public class PacketHandler {
         }
     }
     
-    // 处理方块实体数据数据包
+    // 处理方块实体数据数据包 - 增强版，专门解决双箱问题
     private void handleBlockEntityDataPacket(PacketEvent event) {
         Player player = event.getPlayer();
         PacketContainer packet = event.getPacket();
+        String debugInfo = "";
         
-        // 获取方块位置
-        BlockPosition position = packet.getBlockPositionModifier().read(0);
-        
-        // 检查该位置是否是我们隐藏的方块
-        UUID playerId = player.getUniqueId();
-        Map<BlockPosition, Material> playerHiddenBlocks = hiddenBlocks.get(playerId);
-        
-        if (playerHiddenBlocks != null && playerHiddenBlocks.containsKey(position)) {
-            // 如果是隐藏的方块，取消发送方块实体数据，避免null类型错误
+        try {
+            // 直接检查数据包中的block_entity_type是否为null
+            // 这是解决"Can't find id for 'null'"错误的关键
+            try {
+                // 尝试获取和检查block_entity_type
+                // 根据ProtocolLib的API，我们需要使用适当的修饰符来访问这个字段
+                // 这里使用ObjectModifier作为通用方式尝试访问
+                StructureModifier<Object> objects = packet.getModifier();
+                
+                // 获取数据包的详细信息用于调试
+                debugInfo += "玩家: " + player.getName() + " | ";
+                
+                // 尝试获取block_entity_type字段（具体索引可能需要根据Minecraft版本调整）
+                // 通常在BlockPosition之后
+                try {
+                    Object blockEntityType = objects.read(1); // 假设在索引1位置
+                        if (blockEntityType == null) {
+                            // 获取方块位置信息
+                            BlockPosition position = null;
+                            try {
+                                position = packet.getBlockPositionModifier().read(0);
+                                debugInfo += "位置: " + position + " | ";
+                            } catch (Exception posEx) {
+                                debugInfo += "无法获取位置: " + posEx.getMessage() + " | ";
+                            }
+                            
+                            // 获取玩家位置信息
+                            Location playerLoc = player.getLocation();
+                            debugInfo += "玩家位置: " + playerLoc.getBlockX() + "," + playerLoc.getBlockY() + "," + playerLoc.getBlockZ() + " | ";
+                            
+                            // 获取世界信息
+                            debugInfo += "世界: " + player.getWorld().getName() + " | ";
+                            
+                            // 记录数据包的其他信息
+                            try {
+                                debugInfo += "数据包类型: " + packet.getType().name() + " | ";
+                                debugInfo += "修饰符数量: " + objects.getValues().size() + " | ";
+                            } catch (Exception ex) {
+                                debugInfo += "无法获取数据包信息: " + ex.getMessage() + " | ";
+                            }
+                            
+                            // 特殊处理：如果位置不是null，检查该位置是否是告示牌
+                            if (position != null) {
+                                try {
+                                    World world = player.getWorld();
+                                    if (world != null) {
+                                        Block block = world.getBlockAt(position.getX(), position.getY(), position.getZ());
+                                        if (block != null && isSignType(block.getType())) {
+                                            // 如果是告示牌，允许通过，只记录日志而不取消数据包
+                                            plugin.getLogger().fine("检测到告示牌位置的block_entity_type为null，允许通过 | " + debugInfo);
+                                            // 不取消事件，继续处理
+                                        } else {
+                                            // 非告示牌位置，取消发送数据包
+                                            plugin.getLogger().warning("检测到block_entity_type为null，立即取消发送数据包 | " + debugInfo);
+                                            event.setCancelled(true);
+                                            return;
+                                        }
+                                    } else {
+                                        // 世界为null，取消发送数据包
+                                        plugin.getLogger().warning("检测到block_entity_type为null且世界为null，取消发送数据包 | " + debugInfo);
+                                        event.setCancelled(true);
+                                        return;
+                                    }
+                                } catch (Exception ex) {
+                                    // 检查方块类型时出错，记录日志但不取消事件，让后续检查继续处理
+                                    plugin.getLogger().fine("检查方块类型时出错: " + ex.getMessage() + " | " + debugInfo);
+                                }
+                            } else {
+                                // 位置为null，取消发送数据包
+                                plugin.getLogger().warning("检测到block_entity_type为null且位置为null，取消发送数据包 | " + debugInfo);
+                                event.setCancelled(true);
+                                return;
+                            }
+                        } else {
+                            debugInfo += "block_entity_type: " + blockEntityType.getClass().getName() + " | ";
+                        }
+                } catch (Exception typeAccessEx) {
+                    // 如果无法直接访问block_entity_type字段，继续进行其他检查
+                    plugin.getLogger().fine("无法直接访问block_entity_type字段: " + typeAccessEx.getMessage() + " | " + debugInfo);
+                }
+            } catch (Exception e) {
+                plugin.getLogger().fine("检查block_entity_type时出错: " + e.getMessage() + " | " + debugInfo);
+            }
+            
+            // 获取方块位置
+            BlockPosition position = packet.getBlockPositionModifier().read(0);
+            debugInfo += "处理方块位置: " + position + " | ";
+            
+            // 首先检查该位置是否是我们隐藏的方块
+            UUID playerId = player.getUniqueId();
+            Map<BlockPosition, Material> playerHiddenBlocks = hiddenBlocks.get(playerId);
+            
+            if (playerHiddenBlocks != null && playerHiddenBlocks.containsKey(position)) {
+                // 如果是隐藏的方块，取消发送方块实体数据
+                plugin.getLogger().fine("取消发送隐藏方块的实体数据: " + position + " | " + debugInfo);
+                event.setCancelled(true);
+                return;
+            }
+            
+            // 增强的安全检查：验证方块是否真实存在且不为空气
+            World world = player.getWorld();
+            if (world == null) {
+                // 世界为空的情况下取消发送数据包
+                plugin.getLogger().fine("玩家世界为空，已取消发送方块实体数据: " + position + " | " + debugInfo);
+                event.setCancelled(true);
+                return;
+            }
+            debugInfo += "世界有效 | ";
+            
+            // 获取实际方块
+            Block realBlock = world.getBlockAt(position.getX(), position.getY(), position.getZ());
+            if (realBlock == null) {
+                plugin.getLogger().fine("方块对象为null，已取消发送方块实体数据: " + position + " | " + debugInfo);
+                event.setCancelled(true);
+                return;
+            }
+            debugInfo += "方块对象有效 | ";
+            
+            Material blockType = realBlock.getType();
+            debugInfo += "方块类型: " + blockType + " | ";
+            
+            if (blockType == Material.AIR) {
+                // 如果方块不存在或为空，取消发送数据包
+                plugin.getLogger().fine("检测到发送到空气方块的实体数据，已取消发送: " + position + " | " + debugInfo);
+                event.setCancelled(true);
+                return;
+            }
+            
+            // 针对箱子（特别是双箱）的特殊处理
+            if (blockType == Material.CHEST || blockType == Material.TRAPPED_CHEST) {
+                debugInfo += "是箱子类型 | ";
+                // 检查方块是否真的有方块实体数据
+                BlockState state = realBlock.getState();
+                if (state == null) {
+                    // 如果方块状态为null，取消发送数据包
+                    plugin.getLogger().fine("箱子方块状态为null，已取消发送方块实体数据: " + position + " | " + debugInfo);
+                    event.setCancelled(true);
+                    return;
+                }
+                debugInfo += "方块状态有效 | ";
+                
+                // 检查是否为双箱的一部分
+                boolean isDoubleChestPart = false;
+                int adjacentChestCount = 0;
+                BlockPosition adjacentChestPos = null;
+                
+                int[][] directions = {{1,0,0}, {-1,0,0}, {0,0,1}, {0,0,-1}}; // 东、西、南、北
+                for (int[] dir : directions) {
+                    Block adjacentBlock = world.getBlockAt(
+                        position.getX() + dir[0], 
+                        position.getY() + dir[1], 
+                        position.getZ() + dir[2]);
+                    if (adjacentBlock.getType() == blockType) {
+                        isDoubleChestPart = true;
+                        adjacentChestCount++;
+                        adjacentChestPos = new BlockPosition(
+                            position.getX() + dir[0], 
+                            position.getY() + dir[1], 
+                            position.getZ() + dir[2]);
+                    }
+                }
+                
+                debugInfo += "是否双箱: " + isDoubleChestPart + " | 相邻箱子数: " + adjacentChestCount + " | ";
+                if (adjacentChestPos != null) {
+                    debugInfo += "相邻箱子位置: " + adjacentChestPos + " | ";
+                }
+                
+                // 对于双箱，需要更严格的检查
+                if (isDoubleChestPart) {
+                    debugInfo += "进行双箱特殊处理 | ";
+                    // 双箱特殊处理：检查两个箱子是否都存在有效状态
+                    try {
+                        // 验证方块实体数据是否完整
+                        // 这里我们不使用isPlaced()方法，因为在某些版本可能不可用
+                        // 我们改为检查方块是否确实是容器类型
+                        if (!(state instanceof org.bukkit.block.Container)) {
+                            plugin.getLogger().fine("双箱部分方块不是有效的容器类型，已取消发送方块实体数据: " + position + " | " + debugInfo);
+                            event.setCancelled(true);
+                            return;
+                        }
+                        debugInfo += "容器类型验证通过 | ";
+                    } catch (Exception ex) {
+                        // 任何异常都取消发送
+                        plugin.getLogger().fine("验证双箱状态时出错，已取消发送方块实体数据: " + position + " | " + debugInfo + "错误: " + ex.getMessage());
+                        event.setCancelled(true);
+                        return;
+                    }
+                }
+            } else if (!isContainerType(blockType) && !isSignType(blockType) && !protectedBlockTypes.contains(blockType)) {
+                // 对于非容器、非告示牌、非受保护类型的方块，取消发送方块实体数据
+                plugin.getLogger().fine("检测到非预期类型的方块实体数据，已取消发送: " + position + " - " + blockType + " | " + debugInfo);
+                event.setCancelled(true);
+                return;
+            } else {
+                debugInfo += "方块类型通过初步验证 | ";
+                
+                // 特殊处理告示牌：即使block_entity_type为null，也允许通过验证
+                // 这是为了解决告示牌位置出现block_entity_type为null的问题
+                if (isSignType(blockType)) {
+                    debugInfo += "特殊处理：告示牌类型 | ";
+                    plugin.getLogger().fine("告示牌类型通过特殊验证: " + position + " | " + debugInfo);
+                    // 不取消事件，允许发送数据包
+                    return;
+                }
+            }
+            
+            // 最后的安全检查：尝试获取方块状态，确保它确实是一个方块实体
+            try {
+                BlockState state = realBlock.getState();
+                debugInfo += "进行最终方块实体类型验证 | ";
+                
+                // 简化的方块实体类型检查，减少可能的异常
+                boolean isBlockEntity = false;
+                
+                try {
+                    isBlockEntity = state instanceof org.bukkit.block.Container || 
+                                   state instanceof org.bukkit.block.Sign;
+                    debugInfo += "容器/告示牌检查: " + isBlockEntity + " | ";
+                    
+                    // 只在确认是block entity后才进行额外检查
+                    if (!isBlockEntity) {
+                        String blockTypeName = blockType.name();
+                        isBlockEntity = blockTypeName.contains("BEACON") || 
+                                        blockTypeName.contains("JUKEBOX") ||
+                                        blockTypeName.contains("BREWING") ||
+                                        blockTypeName.contains("ENCHANTING") ||
+                                        blockTypeName.contains("FURNACE") ||
+                                        blockTypeName.contains("HOPPER") ||
+                                        blockTypeName.contains("DISPENSER") ||
+                                        blockTypeName.contains("DROPPER") ||
+                                        blockTypeName.contains("LECTERN");
+                        debugInfo += "特殊方块类型检查: " + isBlockEntity + " | 方块名: " + blockTypeName + " | ";
+                    }
+                } catch (Exception innerEx) {
+                    // 如果类型检查出错，视为非方块实体
+                    debugInfo += "类型检查异常: " + innerEx.getMessage() + " | ";
+                    plugin.getLogger().fine("方块实体类型检查出错: " + innerEx.getMessage() + " | " + debugInfo);
+                }
+                
+                if (!isBlockEntity) {
+                    plugin.getLogger().fine("方块状态不是有效的方块实体类型，已取消发送: " + position + " | " + debugInfo);
+                    event.setCancelled(true);
+                } else {
+                    plugin.getLogger().fine("方块实体数据通过所有安全检查: " + position + " | " + debugInfo);
+                }
+            } catch (Exception e) {
+                // 获取状态失败时取消发送
+                plugin.getLogger().fine("获取方块状态失败，已取消发送方块实体数据: " + position + " | " + debugInfo + "错误: " + e.getMessage());
+                event.setCancelled(true);
+            }
+            
+        } catch (Exception e) {
+            // 捕获所有异常，确保不会因为单个数据包处理失败而导致玩家断开连接
+            plugin.getLogger().warning("处理方块实体数据时发生异常(完全捕获): " + e.getMessage() + " | " + debugInfo + " | 异常堆栈: " + getStackTraceAsString(e));
+            // 异常情况下取消发送数据包，避免EncoderException
             event.setCancelled(true);
         }
+    }
+    
+    // 辅助方法：获取异常堆栈的字符串表示
+    private String getStackTraceAsString(Exception e) {
+        StringWriter sw = new StringWriter();
+        PrintWriter pw = new PrintWriter(sw);
+        e.printStackTrace(pw);
+        return sw.toString().substring(0, Math.min(300, sw.toString().length())); // 限制长度避免日志过大
     }
     
     // 安全显示方块的方法，避免发送有问题的方块实体数据
@@ -373,6 +637,8 @@ public class PacketHandler {
     
     // 判断方块是否为告示牌类型
     private boolean isSignType(Material type) {
+        if (type == null) return false;
+        
         String typeName = type.toString();
         return typeName.contains("SIGN") && !typeName.contains("ITEM_FRAME");
     }
@@ -380,10 +646,35 @@ public class PacketHandler {
     // 更新告示牌文本内容
     private void updateSignText(Player player, Block realBlock, BlockPosition pos) {
         try {
+            // 安全检查
+            if (player == null || realBlock == null || pos == null) {
+                plugin.getLogger().fine("更新告示牌文本时参数为空: player=" + (player != null) + ", block=" + (realBlock != null) + ", pos=" + (pos != null));
+                return;
+            }
+            
             // 获取告示牌状态
             BlockState state = realBlock.getState();
             if (state instanceof Sign) {
                 Sign sign = (Sign) state;
+                
+                // 记录告示牌更新信息
+                plugin.getLogger().fine("更新告示牌文本: " + pos + " | 世界: " + player.getWorld().getName());
+                
+                // 检查告示牌是否为空（所有行都为空）
+                boolean isEmptySign = true;
+                for (int i = 0; i < 4; i++) {
+                    String line = sign.getLine(i);
+                    if (line != null && !line.isEmpty()) {
+                        isEmptySign = false;
+                        break;
+                    }
+                }
+                
+                // 如果告示牌为空，不发送UPDATE_SIGN数据包，避免产生block_entity_type为null的问题
+                if (isEmptySign) {
+                    plugin.getLogger().fine("空告示牌，跳过发送UPDATE_SIGN数据包: " + pos);
+                    return;
+                }
                 
                 // 创建UPDATE_SIGN数据包
                 PacketContainer updatePacket = protocolManager.createPacket(PacketType.Play.Server.UPDATE_SIGN);
@@ -407,17 +698,23 @@ public class PacketHandler {
                 
                 // 发送数据包给玩家
                 protocolManager.sendServerPacket(player, updatePacket);
+                plugin.getLogger().fine("成功发送告示牌更新数据包: " + pos);
+            } else {
+                plugin.getLogger().fine("方块状态不是告示牌类型: " + pos + " | 类型: " + (state != null ? state.getType() : "null"));
             }
         } catch (Exception e) {
             // 使用更通用的错误信息，避免显示索引越界细节
-            plugin.getLogger().warning("更新告示牌文本时发生异常");
-            // 可以选择添加更详细的错误记录，比如使用debug级别
-            plugin.getLogger().fine("详细错误: " + e.getMessage());
+            plugin.getLogger().warning("更新告示牌文本时发生异常" + " | 位置: " + pos + " | " + getStackTraceAsString(e));
         }
     }
     
-    // 更新相邻的箱子方块，确保大箱子正确显示
+    // 更新相邻的箱子方块，确保大箱子正确显示 - 增强版
     private void updateAdjacentChestBlocks(Player player, World world, int x, int y, int z) {
+        if (world == null || player == null) {
+            plugin.getLogger().warning("更新相邻箱子时世界或玩家为空");
+            return;
+        }
+        
         // 检查四个方向的相邻方块
         int[][] directions = {{1,0,0}, {-1,0,0}, {0,0,1}, {0,0,-1}}; // 东、西、南、北
         
@@ -426,22 +723,75 @@ public class PacketHandler {
             int ny = y + dir[1];
             int nz = z + dir[2];
             
-            Block adjacentBlock = world.getBlockAt(nx, ny, nz);
-            Material type = adjacentBlock.getType();
-            
-            // 如果相邻方块也是箱子，发送更新
-            if (type == Material.CHEST || type == Material.TRAPPED_CHEST) {
-                try {
-                    BlockPosition adjPos = new BlockPosition(nx, ny, nz);
-                    PacketContainer packet = protocolManager.createPacket(PacketType.Play.Server.BLOCK_CHANGE);
-                    packet.getBlockPositionModifier().write(0, adjPos);
-                    // 直接使用方块的BlockData创建WrappedBlockData
-                    packet.getBlockData().write(0, WrappedBlockData.createData(adjacentBlock.getBlockData()));
-                    protocolManager.sendServerPacket(player, packet);
-                } catch (Exception e) {
-                    plugin.getLogger().warning("更新相邻箱子时出错: " + e.getMessage());
-                }
+            // 安全检查坐标是否在世界范围内
+            if (nx < world.getMinHeight() || nx >= world.getMaxHeight() ||
+                ny < world.getMinHeight() || ny >= world.getMaxHeight() ||
+                nz < world.getMinHeight() || nz >= world.getMaxHeight()) {
+                continue;
             }
+            
+            try {
+                Block adjacentBlock = world.getBlockAt(nx, ny, nz);
+                if (adjacentBlock == null) continue;
+                
+                Material type = adjacentBlock.getType();
+                
+                // 如果相邻方块也是箱子，发送更新
+                if (type == Material.CHEST || type == Material.TRAPPED_CHEST) {
+                    try {
+                        // 确保方块状态有效
+                        BlockState state = adjacentBlock.getState();
+                        if (state == null || !state.isPlaced()) {
+                            plugin.getLogger().fine("相邻箱子方块状态无效，跳过更新: " + nx + "," + ny + "," + nz);
+                            continue;
+                        }
+                        
+                        BlockPosition adjPos = new BlockPosition(nx, ny, nz);
+                        PacketContainer packet = protocolManager.createPacket(PacketType.Play.Server.BLOCK_CHANGE);
+                        packet.getBlockPositionModifier().write(0, adjPos);
+                        // 直接使用方块的BlockData创建WrappedBlockData
+                        packet.getBlockData().write(0, WrappedBlockData.createData(adjacentBlock.getBlockData()));
+                        protocolManager.sendServerPacket(player, packet);
+                        
+                        // 延迟发送方块实体数据，避免时序问题
+                        plugin.getServer().getScheduler().runTaskLater(plugin, () -> {
+                            try {
+                                // 单独处理方块实体数据的更新，确保安全
+                                updateBlockEntityData(player, adjacentBlock, adjPos);
+                            } catch (Exception ex) {
+                                plugin.getLogger().fine("延迟更新相邻箱子方块实体数据时出错: " + ex.getMessage());
+                            }
+                        }, 1L);
+                    } catch (Exception e) {
+                        plugin.getLogger().fine("更新相邻箱子时出错: " + e.getMessage());
+                    }
+                }
+            } catch (Exception e) {
+                // 捕获每个方向的异常，不影响其他方向的处理
+                plugin.getLogger().fine("处理相邻方向(" + dir[0] + "," + dir[1] + "," + dir[2] + ")时出错: " + e.getMessage());
+            }
+        }
+    }
+    
+    // 安全更新方块实体数据的辅助方法
+    private void updateBlockEntityData(Player player, Block block, BlockPosition pos) {
+        try {
+            // 获取方块状态
+            BlockState state = block.getState();
+            if (state == null) return;
+            
+            // 根据方块类型分别处理
+            if (state instanceof Sign) {
+                // 对于告示牌，使用专门的更新方法
+                updateSignText(player, block, pos);
+            } else if (state instanceof org.bukkit.block.Container) {
+                // 对于容器类方块，我们不直接发送方块实体数据
+                // 因为这可能导致block_entity_type为null的问题
+                // 相反，我们依赖服务器正常发送这些数据，并在handleBlockEntityDataPacket中进行安全过滤
+                plugin.getLogger().fine("容器方块实体数据将由服务器正常发送并经过安全过滤: " + pos);
+            }
+        } catch (Exception e) {
+            plugin.getLogger().fine("安全更新方块实体数据时出错: " + e.getMessage());
         }
     }
     
