@@ -6,6 +6,7 @@ import com.comphenix.protocol.ProtocolManager;
 import com.comphenix.protocol.events.PacketAdapter;
 import com.comphenix.protocol.events.PacketContainer;
 import com.comphenix.protocol.events.PacketEvent;
+import com.comphenix.protocol.reflect.StructureModifier;
 import com.comphenix.protocol.wrappers.BlockPosition;
 import com.comphenix.protocol.wrappers.WrappedBlockData;
 import org.bukkit.Chunk;
@@ -253,16 +254,30 @@ public class PacketHandler {
                 PacketContainer updatePacket = protocolManager.createPacket(PacketType.Play.Server.UPDATE_SIGN);
                 updatePacket.getBlockPositionModifier().write(0, pos);
                 
-                // 写入告示牌文本
-                for (int i = 0; i < 4; i++) {
-                    updatePacket.getStrings().write(i, sign.getLine(i));
+                // 简化的文本写入方式，避免索引越界
+                StructureModifier<String> stringModifier = updatePacket.getStrings();
+                
+                // 尝试安全地写入文本行，捕获每一行可能的索引错误
+                // 使用getValues()检查是否有足够的字段可用
+                List<String> values = stringModifier.getValues();
+                for (int i = 0; i < 4 && i < values.size(); i++) {
+                    try {
+                        String line = sign.getLine(i) != null ? sign.getLine(i) : "";
+                        stringModifier.write(i, line);
+                    } catch (Exception ex) {
+                        // 忽略单行错误，继续处理其他行
+                        plugin.getLogger().fine("写入告示牌第" + i + "行时出错: " + ex.getMessage());
+                    }
                 }
                 
                 // 发送数据包给玩家
                 protocolManager.sendServerPacket(player, updatePacket);
             }
         } catch (Exception e) {
-            plugin.getLogger().warning("更新告示牌文本时出错: " + e.getMessage());
+            // 使用更通用的错误信息，避免显示索引越界细节
+            plugin.getLogger().warning("更新告示牌文本时发生异常");
+            // 可以选择添加更详细的错误记录，比如使用debug级别
+            plugin.getLogger().fine("详细错误: " + e.getMessage());
         }
     }
     
