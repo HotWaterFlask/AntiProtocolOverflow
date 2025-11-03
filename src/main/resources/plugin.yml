@@ -1,0 +1,21 @@
+name: AntiProtocolOverflow
+version: 1.0
+description: 防止禁人书盒、禁人塔建筑，保护服务器免受协议溢出攻击
+author: HotWaterFlask
+main: com.minecraft.antiprotocoloverflow.AntiProtocolOverflow
+api-version: 1.21
+
+commands:
+  antiprotocol:
+    description: 管理AntiProtocolOverflow插件
+    usage: /<command> [reload]
+    aliases: [ap, antioverflow]
+    permission: antiprotocoloverflow.admin
+
+permissions:
+  antiprotocoloverflow.admin:
+    description: 允许管理插件设置
+    default: op
+  antiprotocoloverflow.bypass:
+    description: 绕过容器放置和交互限制
+    default: false
