@@ -13,6 +13,8 @@ import org.bukkit.Location;
 import org.bukkit.Material;
 import org.bukkit.World;
 import org.bukkit.block.Block;
+import org.bukkit.block.BlockState;
+import org.bukkit.block.Sign;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.player.PlayerTeleportEvent;
@@ -209,6 +211,7 @@ public class PacketHandler {
                 // 获取世界中的实际方块，使用真实的方块状态
                 World world = player.getWorld();
                 Block realBlock = world.getBlockAt(pos.getX(), pos.getY(), pos.getZ());
+                Material type = realBlock.getType();
                 
                 // 发送恢复方块的数据包，使用实际方块的完整数据（包括方向、状态等）
                 PacketContainer packet = protocolManager.createPacket(PacketType.Play.Server.BLOCK_CHANGE);
@@ -218,12 +221,48 @@ public class PacketHandler {
                 protocolManager.sendServerPacket(player, packet);
                 
                 // 对于大箱子等复合方块，还需要发送相邻方块的更新
-                if (realBlock.getType() == Material.CHEST || realBlock.getType() == Material.TRAPPED_CHEST) {
+                if (type == Material.CHEST || type == Material.TRAPPED_CHEST) {
                     updateAdjacentChestBlocks(player, world, pos.getX(), pos.getY(), pos.getZ());
+                }
+                
+                // 对于告示牌，额外发送UPDATE_SIGN数据包来更新文本内容
+                if (isSignType(type)) {
+                    updateSignText(player, realBlock, pos);
                 }
             } catch (Exception e) {
                 plugin.getLogger().warning("显示方块时出错: " + e.getMessage());
             }
+        }
+    }
+    
+    // 判断方块是否为告示牌类型
+    private boolean isSignType(Material type) {
+        String typeName = type.toString();
+        return typeName.contains("SIGN") && !typeName.contains("ITEM_FRAME");
+    }
+    
+    // 更新告示牌文本内容
+    private void updateSignText(Player player, Block realBlock, BlockPosition pos) {
+        try {
+            // 获取告示牌状态
+            BlockState state = realBlock.getState();
+            if (state instanceof Sign) {
+                Sign sign = (Sign) state;
+                
+                // 创建UPDATE_SIGN数据包
+                PacketContainer updatePacket = protocolManager.createPacket(PacketType.Play.Server.UPDATE_SIGN);
+                updatePacket.getBlockPositionModifier().write(0, pos);
+                
+                // 写入告示牌文本
+                for (int i = 0; i < 4; i++) {
+                    updatePacket.getStrings().write(i, sign.getLine(i));
+                }
+                
+                // 发送数据包给玩家
+                protocolManager.sendServerPacket(player, updatePacket);
+            }
+        } catch (Exception e) {
+            plugin.getLogger().warning("更新告示牌文本时出错: " + e.getMessage());
         }
     }
     
