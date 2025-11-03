@@ -131,7 +131,13 @@ public class PacketHandler {
         protocolManager.addPacketListener(new PacketAdapter(plugin, PacketType.Play.Server.MAP_CHUNK) {
             @Override
             public void onPacketSending(PacketEvent event) {
-                handleChunkDataPacket(event);
+                try {
+                    handleChunkDataPacket(event);
+                } catch (Exception e) {
+                    // 捕获异常，防止服务器崩溃或玩家被踢出
+                    plugin.getLogger().warning("处理区块数据包时发生异常: " + e.getMessage());
+                    event.setCancelled(true);
+                }
             }
         });
         
@@ -139,9 +145,138 @@ public class PacketHandler {
         protocolManager.addPacketListener(new PacketAdapter(plugin, PacketType.Play.Server.BLOCK_CHANGE) {
             @Override
             public void onPacketSending(PacketEvent event) {
-                handleBlockChangePacket(event);
+                try {
+                    handleBlockChangePacket(event);
+                } catch (Exception e) {
+                    // 捕获异常，防止服务器崩溃或玩家被踢出
+                    plugin.getLogger().warning("处理方块变化数据包时发生异常: " + e.getMessage());
+                    event.setCancelled(true);
+                }
             }
         });
+        
+        // 监听方块实体数据数据包（TILE_ENTITY_DATA - ProtocolLib 5.4.0中的正确常量）
+        try {
+            // 使用ProtocolLib 5.4.0中正确的常量名称TILE_ENTITY_DATA
+            protocolManager.addPacketListener(new PacketAdapter(plugin, PacketType.Play.Server.TILE_ENTITY_DATA) {
+                @Override
+                public void onPacketSending(PacketEvent event) {
+                    try {
+                        handleBlockEntityDataPacket(event);
+                    } catch (Exception e) {
+                        // 静默处理异常，不影响玩家
+                    }
+                }
+            });
+            
+            // 同时监听UPDATE_SIGN数据包，因为它也可能包含方块实体数据
+            if (PacketType.Play.Server.UPDATE_SIGN != null) {
+                protocolManager.addPacketListener(new PacketAdapter(plugin, PacketType.Play.Server.UPDATE_SIGN) {
+                    @Override
+                    public void onPacketSending(PacketEvent event) {
+                        try {
+                            handleBlockEntityDataPacket(event);
+                        } catch (Exception e) {
+                            // 静默处理异常，不影响玩家
+                        }
+                    }
+                });
+            }
+        } catch (Exception e) {
+            plugin.getLogger().warning("注册方块实体数据监听器时发生错误: " + e.getMessage());
+        }
+    }
+    
+    // 处理方块实体数据数据包
+    private void handleBlockEntityDataPacket(PacketEvent event) {
+        Player player = event.getPlayer();
+        PacketContainer packet = event.getPacket();
+        
+        // 获取方块位置
+        BlockPosition position = packet.getBlockPositionModifier().read(0);
+        
+        // 检查该位置是否是我们隐藏的方块
+        UUID playerId = player.getUniqueId();
+        Map<BlockPosition, Material> playerHiddenBlocks = hiddenBlocks.get(playerId);
+        
+        if (playerHiddenBlocks != null && playerHiddenBlocks.containsKey(position)) {
+            // 如果是隐藏的方块，取消发送方块实体数据，避免null类型错误
+            event.setCancelled(true);
+        }
+    }
+    
+    // 安全显示方块的方法，避免发送有问题的方块实体数据
+    private void safeShowBlock(Player player, BlockPosition pos, Material originalType) {
+        try {
+            // 检查方块位置是否有效
+            World world = player.getWorld();
+            if (world == null) {
+                throw new IllegalArgumentException("玩家世界为空");
+            }
+            
+            // 获取世界中的实际方块
+            Block realBlock = world.getBlockAt(pos.getX(), pos.getY(), pos.getZ());
+            
+            // 验证方块是否存在且类型与记录一致
+            if (realBlock.getType() != originalType && originalType != null) {
+                plugin.getLogger().warning("方块类型不匹配，跳过显示: " + pos);
+                return;
+            }
+            
+            // 发送恢复方块的数据包
+            PacketContainer packet = protocolManager.createPacket(PacketType.Play.Server.BLOCK_CHANGE);
+            packet.getBlockPositionModifier().write(0, pos);
+            packet.getBlockData().write(0, WrappedBlockData.createData(realBlock.getBlockData()));
+            protocolManager.sendServerPacket(player, packet);
+            
+            // 对于大箱子等复合方块，安全地更新相邻方块
+            if (originalType == Material.CHEST || originalType == Material.TRAPPED_CHEST) {
+                try {
+                    updateAdjacentChestBlocks(player, world, pos.getX(), pos.getY(), pos.getZ());
+                } catch (Exception e) {
+                    plugin.getLogger().warning("更新相邻箱子时出错，但不影响主方块显示: " + e.getMessage());
+                }
+            }
+            
+            // 对于告示牌，安全地更新文本内容
+            if (isSignType(originalType)) {
+                try {
+                    updateSignText(player, realBlock, pos);
+                } catch (Exception e) {
+                    plugin.getLogger().warning("更新告示牌文本时出错，但不影响主方块显示: " + e.getMessage());
+                }
+            }
+            
+            // 从隐藏列表中移除
+            Map<BlockPosition, Material> playerHiddenBlocks = hiddenBlocks.get(player.getUniqueId());
+            if (playerHiddenBlocks != null) {
+                playerHiddenBlocks.remove(pos);
+            }
+        } catch (Exception e) {
+            // 捕获所有异常，确保不会因为单个方块显示失败而导致更严重的问题
+            throw new RuntimeException("显示方块时发生错误: " + pos, e);
+        }
+    }
+    
+    // 增强隐藏方块管理，确保安全处理方块数据
+    public void safeShowBlocks(Player player) {
+        UUID playerId = player.getUniqueId();
+        Map<BlockPosition, Material> playerHiddenBlocks = hiddenBlocks.get(playerId);
+        
+        if (playerHiddenBlocks != null) {
+            // 直接调用现有的显示方法，但添加额外的错误处理
+            try {
+                showBlocksForPlayer(player);
+            } catch (Exception e) {
+                plugin.getLogger().warning("安全显示方块过程中发生异常: " + e.getMessage());
+                // 即使出现异常，也尝试清理隐藏方块记录
+                try {
+                    playerHiddenBlocks.clear();
+                } catch (Exception cleanupEx) {
+                    plugin.getLogger().severe("清理隐藏方块记录失败: " + cleanupEx.getMessage());
+                }
+            }
+        }
     }
     
     // 注册玩家移动监听器，用于检测距离变化并显示接近的方块
@@ -396,6 +531,8 @@ public class PacketHandler {
         }
     }
     
+    // 删除重复的方法，保留原有的hideBlock实现
+    
     private void scanChunkForProtectedBlocks(Player player, int chunkX, int chunkZ) {
         try {
             World world = player.getWorld();
@@ -487,28 +624,49 @@ public class PacketHandler {
         Map<BlockPosition, Material> playerHiddenBlocks = hiddenBlocks.get(playerId);
         
         if (playerHiddenBlocks != null) {
-            List<Map.Entry<BlockPosition, Material>> blocksList = new ArrayList<>(playerHiddenBlocks.entrySet());
+            // 创建一个副本进行迭代，避免并发修改异常
+            Map<BlockPosition, Material> copyOfHiddenBlocks = new HashMap<>(playerHiddenBlocks);
+            List<BlockPosition> blocksToShow = new ArrayList<>(copyOfHiddenBlocks.keySet());
             final int[] index = {0};
             
-            // 批量显示方块
+            // 批量显示方块，使用安全的显示方法
             plugin.getServer().getScheduler().runTaskTimer(plugin, task -> {
-                int count = 0;
-                
-                while (index[0] < blocksList.size() && count < maxBlocksPerUpdate) {
-                    Map.Entry<BlockPosition, Material> entry = blocksList.get(index[0]);
-                    BlockPosition pos = entry.getKey();
+                try {
+                    int count = 0;
                     
-                    // 使用showBlock方法统一处理
-                    showBlock(player, pos);
+                    while (index[0] < blocksToShow.size() && count < maxBlocksPerUpdate) {
+                        BlockPosition pos = blocksToShow.get(index[0]);
+                        Material originalType = copyOfHiddenBlocks.get(pos);
+                        
+                        // 使用安全的方法显示方块，增强异常处理
+                        try {
+                            safeShowBlock(player, pos, originalType);
+                        } catch (Exception e) {
+                            plugin.getLogger().warning("安全显示方块失败: " + e.getMessage());
+                            // 即使显示失败，也从隐藏列表中移除，避免后续再次尝试导致错误
+                            if (playerHiddenBlocks != null) {
+                                playerHiddenBlocks.remove(pos);
+                            }
+                        }
+                        
+                        index[0]++;
+                        count++;
+                    }
                     
-                    index[0]++;
-                    count++;
-                }
-                
-                if (index[0] >= blocksList.size()) {
+                    if (index[0] >= blocksToShow.size()) {
+                        task.cancel();
+                        // 清除记录
+                        if (playerHiddenBlocks != null) {
+                            playerHiddenBlocks.clear();
+                        }
+                    }
+                } catch (Exception e) {
+                    plugin.getLogger().warning("批量显示方块任务异常: " + e.getMessage());
                     task.cancel();
-                    // 清除记录
-                    playerHiddenBlocks.clear();
+                    // 出错时也尝试清理，避免状态不一致
+                    if (playerHiddenBlocks != null) {
+                        playerHiddenBlocks.clear();
+                    }
                 }
             }, 0, updateInterval / 50);
         }
