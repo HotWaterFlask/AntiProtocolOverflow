@@ -9,6 +9,9 @@ import com.comphenix.protocol.events.PacketEvent;
 import com.comphenix.protocol.reflect.StructureModifier;
 import com.comphenix.protocol.wrappers.BlockPosition;
 import com.comphenix.protocol.wrappers.WrappedBlockData;
+import com.comphenix.protocol.wrappers.nbt.NbtCompound;
+import com.comphenix.protocol.wrappers.nbt.NbtFactory;
+import org.bukkit.Bukkit;
 import org.bukkit.Chunk;
 import org.bukkit.Location;
 import org.bukkit.Material;
@@ -18,10 +21,19 @@ import org.bukkit.block.BlockState;
 import org.bukkit.block.Sign;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
-import org.bukkit.event.player.PlayerTeleportEvent;
 import org.bukkit.event.Listener;
+import org.bukkit.event.block.BlockBreakEvent;
+import org.bukkit.event.block.BlockPlaceEvent;
+import org.bukkit.event.world.ChunkUnloadEvent;
+import org.bukkit.event.player.PlayerChangedWorldEvent;
 import org.bukkit.event.player.PlayerMoveEvent;
+import org.bukkit.event.player.PlayerTeleportEvent;
+import org.bukkit.inventory.Inventory;
+import org.bukkit.inventory.ItemStack;
+import org.bukkit.inventory.meta.BlockStateMeta;
+import org.bukkit.inventory.meta.ItemMeta;
 import org.bukkit.plugin.java.JavaPlugin;
+import org.bukkit.scheduler.BukkitRunnable;
 
 import java.io.PrintWriter;
 import java.io.StringWriter;
@@ -33,13 +45,47 @@ public class PacketHandler {
     private final JavaPlugin plugin;
     private final ProtocolManager protocolManager;
     private final Set<Material> protectedBlockTypes = new HashSet<>();
-    private final Map<UUID, Map<BlockPosition, Material>> hiddenBlocks = new ConcurrentHashMap<>();
-    private final Map<UUID, Set<Location>> processedChunks = new ConcurrentHashMap<>();
+    // 存储每个玩家在每个世界中隐藏的方块，使用UUID+世界名称作为键
+    private final Map<String, Map<BlockPosition, Material>> hiddenBlocks = new ConcurrentHashMap<>();
+    // 存储每个玩家在每个世界中已处理的区块，使用UUID+世界名称作为键
+    private final Map<String, Set<Location>> processedChunks = new ConcurrentHashMap<>();
+    
+    // 获取玩家在特定世界的数据键
+    private String getDataKey(UUID playerId, World world) {
+        return playerId.toString() + "-" + world.getName();
+    }
+    
+    // 物品栏加载相关数据结构
+    private final Map<UUID, Map<Integer, List<DelayedItem>>> delayedItems = new ConcurrentHashMap<>();
+    private final Map<UUID, Boolean> isLoadingInventory = new ConcurrentHashMap<>();
+    private final Map<Integer, Boolean> isLoadingContainer = new ConcurrentHashMap<>();
+    private final Map<UUID, Integer> currentWindowId = new ConcurrentHashMap<>();
+    
+    // 物品栏加载配置
+    private int itemLoadDelay;
+    private int itemsPerLoad;
+    private boolean logLoadEvents;
+    
+    public static class DelayedItem {
+        public final int slot;
+        public final ItemStack item;
+        public final boolean isShulkerBox;
+        
+        public DelayedItem(int slot, ItemStack item, boolean isShulkerBox) {
+            this.slot = slot;
+            this.item = item;
+            this.isShulkerBox = isShulkerBox;
+        }
+    }
     
     // 配置参数
     private final int maxDistance = 16; // 显示保护方块的最大距离
-    private final int maxBlocksPerUpdate = 50; // 每批次更新的最大方块数量
+    private int maxBlocksPerUpdate = 50; // 每批次更新的最大方块数量
     private final long updateInterval = 50; // 更新间隔(毫秒)
+    private boolean enableProtection = true;
+    private boolean slowInventoryLoad = true;
+    private boolean slowBlockLoad = true;
+    private int blockLoadDelay = 50;
     
     public PacketHandler(JavaPlugin plugin) {
         this.plugin = plugin;
@@ -47,13 +93,139 @@ public class PacketHandler {
         initProtectedBlockTypes();
         registerPacketListeners();
         registerPlayerMoveListener();
+        
+        // 从配置加载物品栏加载相关参数
+        this.itemLoadDelay = plugin.getConfig().getInt("item-load-delay", 50);
+        this.itemsPerLoad = plugin.getConfig().getInt("items-per-load", 3);
+        this.logLoadEvents = plugin.getConfig().getBoolean("log-load-events", false);
+    }
+    
+    // 更新配置参数
+    public void updateConfig(int itemLoadDelay, int itemsPerLoad, int blockLoadDelay, int maxBlocksPerUpdate,
+                           boolean logLoadEvents, boolean enableProtection, boolean slowInventoryLoad, boolean slowBlockLoad) {
+        this.itemLoadDelay = itemLoadDelay;
+        this.itemsPerLoad = itemsPerLoad;
+        this.blockLoadDelay = blockLoadDelay;
+        this.maxBlocksPerUpdate = maxBlocksPerUpdate;
+        this.logLoadEvents = logLoadEvents;
+        this.enableProtection = enableProtection;
+        this.slowInventoryLoad = slowInventoryLoad;
+        this.slowBlockLoad = slowBlockLoad;
+    }
+    
+    // 标记玩家背包正在加载
+    public void markInventoryLoading(Player player, boolean loading) {
+        isLoadingInventory.put(player.getUniqueId(), loading);
+    }
+    
+    // 标记容器正在加载
+    public void markContainerLoading(int windowId, boolean loading) {
+        isLoadingContainer.put(windowId, loading);
+    }
+    
+    // 记录玩家当前打开的窗口ID
+    public void setCurrentWindowId(Player player, int windowId) {
+        currentWindowId.put(player.getUniqueId(), windowId);
+    }
+    
+    // 清理玩家数据
+    public void clearPlayerData(Player player) {
+        UUID playerId = player.getUniqueId();
+        
+        // 清理所有世界中的隐藏方块数据
+        Iterator<Map.Entry<String, Map<BlockPosition, Material>>> hiddenIterator = hiddenBlocks.entrySet().iterator();
+        while (hiddenIterator.hasNext()) {
+            if (hiddenIterator.next().getKey().startsWith(playerId.toString() + "-")) {
+                hiddenIterator.remove();
+            }
+        }
+        
+        // 清理所有世界中已处理的区块数据
+        Iterator<Map.Entry<String, Set<Location>>> processedIterator = processedChunks.entrySet().iterator();
+        while (processedIterator.hasNext()) {
+            if (processedIterator.next().getKey().startsWith(playerId.toString() + "-")) {
+                processedIterator.remove();
+            }
+        }
+        
+        // 清理其他玩家相关数据
+        delayedItems.remove(playerId);
+        isLoadingInventory.remove(playerId);
+        currentWindowId.remove(playerId);
+    }
+    
+    // 清理所有数据（服务器关闭时调用）
+    public void clearAllData() {
+        // 清除所有隐藏方块数据
+        hiddenBlocks.clear();
+        // 清除所有已处理区块数据
+        processedChunks.clear();
+        // 清除所有玩家相关数据
+        delayedItems.clear();
+        isLoadingInventory.clear();
+        isLoadingContainer.clear();
+        currentWindowId.clear();
+        
+        plugin.getLogger().info("已清除所有数据");
+    }
+    
+    // 检查物品是否为潜影盒
+    private boolean isShulkerBox(ItemStack item) {
+        if (item == null) return false;
+        return item.getType().toString().contains("SHULKER_BOX");
+    }
+    
+    // 检查潜影盒是否为空
+    private boolean isEmptyShulkerBox(ItemStack shulkerBox) {
+        if (shulkerBox == null || !isShulkerBox(shulkerBox)) return true;
+        
+        try {
+            BlockStateMeta meta = (BlockStateMeta) shulkerBox.getItemMeta();
+            if (meta == null || !meta.hasBlockState()) return true;
+            
+            org.bukkit.block.ShulkerBox shulkerBoxState = (org.bukkit.block.ShulkerBox) meta.getBlockState();
+            return shulkerBoxState.getInventory().isEmpty();
+        } catch (Exception e) {
+            return true;
+        }
+    }
+    
+    // 获取空的潜影盒
+    private ItemStack getEmptyShulkerBox(ItemStack originalShulkerBox) {
+        if (originalShulkerBox == null || !isShulkerBox(originalShulkerBox)) return null;
+        
+        try {
+            ItemStack emptyShulkerBox = new ItemStack(originalShulkerBox.getType());
+            
+            // 复制名称和其他元数据，但不复制内容
+            if (originalShulkerBox.hasItemMeta()) {
+                ItemMeta originalMeta = originalShulkerBox.getItemMeta();
+                if (originalMeta != null) {
+                    ItemMeta emptyMeta = emptyShulkerBox.getItemMeta();
+                    if (emptyMeta != null) {
+                        if (originalMeta.hasDisplayName()) {
+                            emptyMeta.setDisplayName(originalMeta.getDisplayName());
+                        }
+                        if (originalMeta.hasLore()) {
+                            emptyMeta.setLore(originalMeta.getLore());
+                        }
+                        emptyShulkerBox.setItemMeta(emptyMeta);
+                    }
+                }
+            }
+            
+            return emptyShulkerBox;
+        } catch (Exception e) {
+            return null;
+        }
     }
     
     // 初始化玩家数据
     public void initializePlayer(Player player) {
-        // 初始化玩家隐藏方块集合
-        hiddenBlocks.putIfAbsent(player.getUniqueId(), new HashMap<>());
-        processedChunks.putIfAbsent(player.getUniqueId(), new HashSet<>());
+        // 初始化玩家在当前世界的隐藏方块集合
+        String dataKey = getDataKey(player.getUniqueId(), player.getWorld());
+        hiddenBlocks.putIfAbsent(dataKey, new HashMap<>());
+        processedChunks.putIfAbsent(dataKey, new HashSet<>());
     }
     
     private void initProtectedBlockTypes() {
@@ -194,6 +366,239 @@ public class PacketHandler {
         } catch (Exception e) {
             plugin.getLogger().warning("注册方块实体数据监听器时发生错误: " + e.getMessage());
         }
+        
+        // 监听窗口物品数据包 (WINDOW_ITEMS)
+        protocolManager.addPacketListener(new PacketAdapter(plugin, PacketType.Play.Server.WINDOW_ITEMS) {
+            @Override
+            public void onPacketSending(PacketEvent event) {
+                try {
+                    handleWindowItemsPacket(event);
+                } catch (Exception e) {
+                    plugin.getLogger().warning("处理窗口物品数据包时发生异常: " + e.getMessage());
+                    // 不取消数据包，避免物品栏完全不显示
+                }
+            }
+        });
+        
+        // 监听打开窗口数据包 (OPEN_WINDOW)
+        protocolManager.addPacketListener(new PacketAdapter(plugin, PacketType.Play.Server.OPEN_WINDOW) {
+            @Override
+            public void onPacketSending(PacketEvent event) {
+                try {
+                    handleOpenWindowPacket(event);
+                } catch (Exception e) {
+                    plugin.getLogger().warning("处理打开窗口数据包时发生异常: " + e.getMessage());
+                    // 不取消数据包，避免无法打开容器
+                }
+            }
+        });
+        
+        // 监听关闭窗口数据包 (CLOSE_WINDOW)
+        protocolManager.addPacketListener(new PacketAdapter(plugin, PacketType.Play.Server.CLOSE_WINDOW) {
+            @Override
+            public void onPacketSending(PacketEvent event) {
+                try {
+                    handleCloseWindowPacket(event);
+                } catch (Exception e) {
+                    plugin.getLogger().warning("处理关闭窗口数据包时发生异常: " + e.getMessage());
+                }
+            }
+        });
+    }
+    
+    // 处理窗口物品数据包
+    private void handleWindowItemsPacket(PacketEvent event) {
+        Player player = event.getPlayer();
+        UUID playerId = player.getUniqueId();
+        PacketContainer packet = event.getPacket();
+        
+        try {
+            // 获取窗口ID
+            int windowId = packet.getIntegers().read(0);
+            
+            // 检查是否为玩家背包(0)或正在加载的容器
+            boolean isPlayerInventory = (windowId == 0);
+            boolean isLoading = (isPlayerInventory && Boolean.TRUE.equals(isLoadingInventory.getOrDefault(playerId, false))) ||
+                              Boolean.TRUE.equals(isLoadingContainer.getOrDefault(windowId, false));
+            
+            if (!isLoading) return; // 如果不是正在加载的物品栏，直接放行
+            
+            // 获取物品列表
+            StructureModifier<Object> objects = packet.getModifier();
+            List<ItemStack> items = null;
+            try {
+                items = (List<ItemStack>) objects.read(0);
+            } catch (Exception e) {
+                // 如果读取失败，可能是类型不匹配，继续执行
+            }
+            
+            if (items == null) return;
+            
+            // 创建要延迟加载的物品列表
+            List<DelayedItem> delayedItemsList = new ArrayList<>();
+            
+            // 处理物品列表，将普通物品立即显示，潜影盒延迟显示
+            for (int i = 0; i < items.size(); i++) {
+                ItemStack item = items.get(i);
+                if (item != null && item.getType() != Material.AIR) {
+                    if (isShulkerBox(item)) {
+                        if (!isEmptyShulkerBox(item)) {
+                            // 对于非空潜影盒，放入延迟加载列表，并替换为空潜影盒
+                            delayedItemsList.add(new DelayedItem(i, item, true));
+                            ItemStack emptyShulkerBox = getEmptyShulkerBox(item);
+                            if (emptyShulkerBox != null) {
+                                items.set(i, emptyShulkerBox);
+                                if (logLoadEvents) {
+                                    plugin.getLogger().info("为玩家 " + player.getName() + " 替换潜影盒为空盒，槽位: " + i);
+                                }
+                            }
+                        }
+                        // 空潜影盒直接显示
+                    } else {
+                        // 普通物品立即显示，不需要修改
+                    }
+                }
+            }
+            
+            // 如果有延迟加载的物品，启动加载任务
+            if (!delayedItemsList.isEmpty()) {
+                // 存储延迟加载的物品
+                delayedItems.putIfAbsent(playerId, new HashMap<>());
+                delayedItems.get(playerId).put(windowId, delayedItemsList);
+                
+                // 更新数据包中的物品列表
+                objects.write(0, items);
+                
+                // 启动延迟加载任务
+                startDelayedItemsLoading(player, windowId);
+            }
+        } catch (Exception e) {
+            plugin.getLogger().warning("处理窗口物品数据包时发生详细异常: " + e.getMessage());
+            // 不取消数据包，避免物品栏完全不显示
+        }
+    }
+    
+    // 处理打开窗口数据包
+    private void handleOpenWindowPacket(PacketEvent event) {
+        Player player = event.getPlayer();
+        PacketContainer packet = event.getPacket();
+        
+        try {
+            // 获取窗口ID
+            int windowId = packet.getIntegers().read(0);
+            
+            // 记录玩家当前打开的窗口ID
+            setCurrentWindowId(player, windowId);
+            
+            // 标记容器正在加载
+            markContainerLoading(windowId, true);
+            
+            if (logLoadEvents) {
+                plugin.getLogger().info("玩家 " + player.getName() + " 打开窗口，ID: " + windowId + "，标记为正在加载");
+            }
+        } catch (Exception e) {
+            plugin.getLogger().warning("处理打开窗口数据包时发生详细异常: " + e.getMessage());
+        }
+    }
+    
+    // 处理关闭窗口数据包
+    private void handleCloseWindowPacket(PacketEvent event) {
+        Player player = event.getPlayer();
+        UUID playerId = player.getUniqueId();
+        PacketContainer packet = event.getPacket();
+        
+        try {
+            // 获取窗口ID
+            int windowId = packet.getIntegers().read(0);
+            
+            // 清除容器加载标记
+            isLoadingContainer.remove(windowId);
+            
+            // 清除延迟加载的物品
+            if (delayedItems.containsKey(playerId) && delayedItems.get(playerId).containsKey(windowId)) {
+                delayedItems.get(playerId).remove(windowId);
+                if (delayedItems.get(playerId).isEmpty()) {
+                    delayedItems.remove(playerId);
+                }
+            }
+            
+            // 如果是当前窗口，清除当前窗口ID记录
+            Integer currentId = currentWindowId.get(playerId);
+            if (currentId != null && currentId == windowId) {
+                currentWindowId.remove(playerId);
+            }
+            
+            if (logLoadEvents) {
+                plugin.getLogger().info("玩家 " + player.getName() + " 关闭窗口，ID: " + windowId + "，清除加载状态");
+            }
+        } catch (Exception e) {
+            plugin.getLogger().warning("处理关闭窗口数据包时发生详细异常: " + e.getMessage());
+        }
+    }
+    
+    // 开始延迟加载物品
+    private void startDelayedItemsLoading(final Player player, final int windowId) {
+        new BukkitRunnable() {
+            @Override
+            public void run() {
+                UUID playerId = player.getUniqueId();
+                
+                // 检查玩家是否在线以及是否还有延迟加载的物品
+                if (!player.isOnline() || !delayedItems.containsKey(playerId) || 
+                    !delayedItems.get(playerId).containsKey(windowId)) {
+                    this.cancel();
+                    markContainerLoading(windowId, false);
+                    return;
+                }
+                
+                List<DelayedItem> itemsToLoad = delayedItems.get(playerId).get(windowId);
+                
+                // 检查是否还有物品需要加载
+                if (itemsToLoad.isEmpty()) {
+                    // 所有物品加载完成
+                    if (logLoadEvents) {
+                        plugin.getLogger().info("玩家 " + player.getName() + " 的窗口 " + windowId + " 物品加载完成");
+                    }
+                    delayedItems.get(playerId).remove(windowId);
+                    if (delayedItems.get(playerId).isEmpty()) {
+                        delayedItems.remove(playerId);
+                    }
+                    markContainerLoading(windowId, false);
+                    this.cancel();
+                    return;
+                }
+                
+                // 本次加载的物品数量
+                int loadedThisTick = 0;
+                Iterator<DelayedItem> iterator = itemsToLoad.iterator();
+                
+                while (iterator.hasNext() && loadedThisTick < itemsPerLoad) {
+                    DelayedItem delayedItem = iterator.next();
+                    
+                    // 发送SET_SLOT数据包更新单个物品槽
+                    try {
+                        PacketContainer setSlotPacket = protocolManager.createPacket(PacketType.Play.Server.SET_SLOT);
+                        setSlotPacket.getIntegers().write(0, windowId); // 窗口ID
+                        setSlotPacket.getIntegers().write(1, 0); // 状态ID（通常为0）
+                        setSlotPacket.getIntegers().write(2, delayedItem.slot); // 槽位索引
+                        setSlotPacket.getItemModifier().write(0, delayedItem.item); // 物品
+                        
+                        // 发送数据包给玩家
+                        protocolManager.sendServerPacket(player, setSlotPacket);
+                        
+                        // 移除已加载的物品
+                        iterator.remove();
+                        loadedThisTick++;
+                        
+                        if (logLoadEvents) {
+                            plugin.getLogger().info("为玩家 " + player.getName() + " 加载窗口 " + windowId + " 物品槽: " + delayedItem.slot);
+                        }
+                    } catch (Exception e) {
+                        plugin.getLogger().warning("发送SET_SLOT数据包时发生异常: " + e.getMessage());
+                    }
+                }
+            }
+        }.runTaskTimer(plugin, itemLoadDelay / 50L, itemLoadDelay / 50L); // 转换为tick延迟
     }
     
     // 处理方块实体数据数据包 - 增强版，专门解决双箱问题
@@ -292,7 +697,8 @@ public class PacketHandler {
             
             // 首先检查该位置是否是我们隐藏的方块
             UUID playerId = player.getUniqueId();
-            Map<BlockPosition, Material> playerHiddenBlocks = hiddenBlocks.get(playerId);
+            String dataKey = getDataKey(playerId, player.getWorld());
+            Map<BlockPosition, Material> playerHiddenBlocks = hiddenBlocks.get(dataKey);
             
             if (playerHiddenBlocks != null && playerHiddenBlocks.containsKey(position)) {
                 // 如果是隐藏的方块，取消发送方块实体数据
@@ -483,8 +889,8 @@ public class PacketHandler {
             
             // 验证方块是否存在且类型与记录一致
             if (realBlock.getType() != originalType && originalType != null) {
-                plugin.getLogger().warning("方块类型不匹配，跳过显示: " + pos);
-                return;
+                plugin.getLogger().warning("方块类型不匹配，但仍显示实际方块: " + pos + " (记录: " + originalType + ", 实际: " + realBlock.getType() + ")");
+                // 不返回，继续显示实际方块类型
             }
             
             // 发送恢复方块的数据包
@@ -554,11 +960,30 @@ public class PacketHandler {
                     checkAndShowNearbyBlocks(event.getPlayer());
                 }
             }
-            
+
             @EventHandler
             public void onPlayerTeleport(PlayerTeleportEvent event) {
                 // 传送后立即检查并显示周围的方块
                 Player player = event.getPlayer();
+                
+                // 如果是跨世界传送，清除旧世界的数据
+                if (event.getFrom().getWorld() != null && event.getTo() != null && 
+                    !event.getFrom().getWorld().equals(event.getTo().getWorld())) {
+                    UUID playerId = player.getUniqueId();
+                    // 清除隐藏方块数据
+                    Map<BlockPosition, Material> playerHiddenBlocks = hiddenBlocks.get(playerId);
+                    if (playerHiddenBlocks != null) {
+                        playerHiddenBlocks.clear();
+                    }
+                    // 清除已处理区块数据
+                    String dataKey = getDataKey(playerId, player.getWorld());
+            Set<Location> playerProcessedChunks = processedChunks.get(dataKey);
+            if (playerProcessedChunks != null) {
+                playerProcessedChunks.clear();
+                    }
+                    plugin.getLogger().info("玩家 " + player.getName() + " 跨世界传送，已清除旧世界数据");
+                }
+                
                 // 使用延迟任务确保区块已加载
                 plugin.getServer().getScheduler().runTaskLater(plugin, () -> {
                     checkAndShowNearbyBlocks(player);
@@ -566,13 +991,111 @@ public class PacketHandler {
                     showBlocksForPlayer(player);
                 }, 1L); // 1 tick后执行
             }
+
+            @EventHandler
+            public void onPlayerChangedWorld(PlayerChangedWorldEvent event) {
+                // 玩家切换世界时，清除旧世界的数据
+                Player player = event.getPlayer();
+                UUID playerId = player.getUniqueId();
+                
+                // 清除隐藏方块数据
+                Map<BlockPosition, Material> playerHiddenBlocks = hiddenBlocks.get(playerId);
+                if (playerHiddenBlocks != null) {
+                    playerHiddenBlocks.clear();
+                }
+                // 清除已处理区块数据
+                String dataKey = getDataKey(playerId, player.getWorld());
+                Set<Location> playerProcessedChunks = processedChunks.get(dataKey);
+                if (playerProcessedChunks != null) {
+                    playerProcessedChunks.clear();
+                }
+                
+                plugin.getLogger().info("玩家 " + player.getName() + " 切换世界，已清除旧世界数据");
+                
+                // 使用延迟任务确保新世界区块已加载
+                plugin.getServer().getScheduler().runTaskLater(plugin, () -> {
+                    checkAndShowNearbyBlocks(player);
+                    showBlocksForPlayer(player);
+                }, 1L); // 1 tick后执行
+            }
+            
+            @EventHandler
+            public void onBlockBreak(BlockBreakEvent event) {
+                // 玩家破坏方块时，清除所有玩家对该方块的隐藏记录
+                Block block = event.getBlock();
+                World world = block.getWorld();
+                BlockPosition blockPos = new BlockPosition(block.getX(), block.getY(), block.getZ());
+                
+                // 清除所有玩家在该世界中对这个方块的隐藏记录
+                for (Map.Entry<String, Map<BlockPosition, Material>> entry : hiddenBlocks.entrySet()) {
+                    if (entry.getKey().endsWith("-" + world.getName())) {
+                        entry.getValue().remove(blockPos);
+                    }
+                }
+            }
+            
+            @EventHandler
+            public void onBlockPlace(BlockPlaceEvent event) {
+                // 玩家放置方块时，清除所有玩家对该方块位置的隐藏记录
+                Block block = event.getBlock();
+                World world = block.getWorld();
+                BlockPosition blockPos = new BlockPosition(block.getX(), block.getY(), block.getZ());
+                
+                // 清除所有玩家在该世界中对这个方块位置的隐藏记录
+                for (Map.Entry<String, Map<BlockPosition, Material>> entry : hiddenBlocks.entrySet()) {
+                    if (entry.getKey().endsWith("-" + world.getName())) {
+                        entry.getValue().remove(blockPos);
+                    }
+                }
+            }
+            
+            @EventHandler
+            public void onChunkUnload(ChunkUnloadEvent event) {
+                // 区块卸载时，清除所有玩家在该区块中的方块记录
+                Chunk chunk = event.getChunk();
+                World world = chunk.getWorld();
+                int chunkX = chunk.getX();
+                int chunkZ = chunk.getZ();
+                
+                // 清除所有玩家在该世界中该区块的隐藏方块记录
+                for (Map.Entry<String, Map<BlockPosition, Material>> entry : hiddenBlocks.entrySet()) {
+                    if (entry.getKey().endsWith("-" + world.getName())) {
+                        // 使用迭代器安全移除
+                        Iterator<Map.Entry<BlockPosition, Material>> iterator = entry.getValue().entrySet().iterator();
+                        while (iterator.hasNext()) {
+                            BlockPosition pos = iterator.next().getKey();
+                            int blockChunkX = pos.getX() >> 4; // 方块X坐标转换为区块X
+                            int blockChunkZ = pos.getZ() >> 4; // 方块Z坐标转换为区块Z
+                            if (blockChunkX == chunkX && blockChunkZ == chunkZ) {
+                                iterator.remove();
+                            }
+                        }
+                    }
+                }
+                
+                // 清除所有玩家在该世界中该区块的已处理记录
+                for (Map.Entry<String, Set<Location>> entry : processedChunks.entrySet()) {
+                    if (entry.getKey().endsWith("-" + world.getName())) {
+                        // 使用迭代器安全移除
+                        Iterator<Location> iterator = entry.getValue().iterator();
+                        while (iterator.hasNext()) {
+                            Location loc = iterator.next();
+                            if (loc.getChunk().getX() == chunkX && loc.getChunk().getZ() == chunkZ) {
+                                iterator.remove();
+                            }
+                        }
+                    }
+                }
+            }
         }, plugin);
     }
     
     // 检查并显示玩家附近的隐藏方块
     private void checkAndShowNearbyBlocks(Player player) {
         UUID playerId = player.getUniqueId();
-        Map<BlockPosition, Material> playerHiddenBlocks = hiddenBlocks.get(playerId);
+        World world = player.getWorld();
+        String dataKey = getDataKey(playerId, world);
+        Map<BlockPosition, Material> playerHiddenBlocks = hiddenBlocks.get(dataKey);
         
         if (playerHiddenBlocks != null && !playerHiddenBlocks.isEmpty()) {
             List<BlockPosition> toShow = new ArrayList<>();
@@ -602,7 +1125,8 @@ public class PacketHandler {
     // 显示单个隐藏的方块
     private void showBlock(Player player, BlockPosition pos) {
         UUID playerId = player.getUniqueId();
-        Map<BlockPosition, Material> playerHiddenBlocks = hiddenBlocks.get(playerId);
+        String dataKey = getDataKey(playerId, player.getWorld());
+        Map<BlockPosition, Material> playerHiddenBlocks = hiddenBlocks.get(dataKey);
         
         if (playerHiddenBlocks != null && playerHiddenBlocks.containsKey(pos)) {
             playerHiddenBlocks.remove(pos);
@@ -807,7 +1331,8 @@ public class PacketHandler {
             Location chunkLocation = new Location(player.getWorld(), chunkX * 16, 0, chunkZ * 16);
             
             // 记录已处理的区块
-            processedChunks.computeIfAbsent(player.getUniqueId(), k -> new HashSet<>()).add(chunkLocation);
+            String dataKey = getDataKey(player.getUniqueId(), player.getWorld());
+                processedChunks.computeIfAbsent(dataKey, k -> new HashSet<>()).add(chunkLocation);
             
             // 异步扫描区块中的保护方块
             plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
@@ -963,7 +1488,8 @@ public class PacketHandler {
             protocolManager.sendServerPacket(player, packet);
             
             // 记录隐藏的方块
-            hiddenBlocks.computeIfAbsent(player.getUniqueId(), k -> new HashMap<>()).put(pos, originalType);
+            String dataKey = getDataKey(player.getUniqueId(), player.getWorld());
+            hiddenBlocks.computeIfAbsent(dataKey, k -> new HashMap<>()).put(pos, originalType);
         } catch (Exception e) {
             plugin.getLogger().warning("隐藏方块时出错: " + e.getMessage());
         }
@@ -971,7 +1497,9 @@ public class PacketHandler {
     
     public void showBlocksForPlayer(Player player) {
         UUID playerId = player.getUniqueId();
-        Map<BlockPosition, Material> playerHiddenBlocks = hiddenBlocks.get(playerId);
+        World world = player.getWorld();
+        String dataKey = getDataKey(playerId, world);
+        Map<BlockPosition, Material> playerHiddenBlocks = hiddenBlocks.get(dataKey);
         
         if (playerHiddenBlocks != null) {
             // 创建一个副本进行迭代，避免并发修改异常
@@ -1022,13 +1550,7 @@ public class PacketHandler {
         }
     }
     
-    public void clearPlayerData(Player player) {
-        UUID playerId = player.getUniqueId();
-        hiddenBlocks.remove(playerId);
-        if (processedChunks.containsKey(playerId)) {
-            processedChunks.get(playerId).clear();
-        }
-    }
+    // 该方法已在上方定义，避免重复
     
     public void unregister() {
         protocolManager.removePacketListeners(plugin);

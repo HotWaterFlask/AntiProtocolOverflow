@@ -17,6 +17,9 @@ import org.bukkit.event.inventory.InventoryAction;
 import org.bukkit.Location;
 import org.bukkit.inventory.Inventory;
 import org.bukkit.inventory.ItemStack;
+import org.bukkit.inventory.meta.ItemMeta;
+import org.bukkit.inventory.meta.BlockStateMeta;
+import org.bukkit.block.ShulkerBox;
 import org.bukkit.scheduler.BukkitRunnable;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandSender;
@@ -24,6 +27,7 @@ import org.bukkit.plugin.java.JavaPlugin;
 
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
@@ -44,8 +48,7 @@ public class AntiProtocolOverflow extends JavaPlugin implements Listener {
     // 用于跟踪玩家的加载状态
     private final Map<UUID, Boolean> isLoadingInventory = new ConcurrentHashMap<>();
     private final Map<UUID, Integer> inventoryLoadProgress = new ConcurrentHashMap<>();
-    // 用于跟踪容器的加载状态
-    private final Map<Inventory, Boolean> isLoadingContainer = new ConcurrentHashMap<>();
+    // 注意：容器加载状态现在由PacketHandler管理，不再需要这里的跟踪
     // 用于跟踪已加载的区块
     private final Map<UUID, Set<Chunk>> loadedChunks = new ConcurrentHashMap<>();
     
@@ -81,7 +84,10 @@ public class AntiProtocolOverflow extends JavaPlugin implements Listener {
         try {
             if (Bukkit.getPluginManager().isPluginEnabled("ProtocolLib")) {
                 packetHandler = new PacketHandler(this);
-                logger.info("成功初始化ProtocolLib支持，使用数据包层处理方块");
+                // 更新数据包处理器中的配置
+        packetHandler.updateConfig(itemLoadDelay, itemsPerLoad, blockLoadDelay, 50, 
+                                  logLoadEvents, enableProtection, slowInventoryLoad, slowBlockLoad);
+        logger.info("成功初始化ProtocolLib支持，使用数据包层处理方块和物品");
             } else {
                 logger.warning("未检测到ProtocolLib，插件将无法正常工作！");
                 logger.warning("请安装ProtocolLib 5.4.0或更高版本以使用此插件");
@@ -96,15 +102,23 @@ public class AntiProtocolOverflow extends JavaPlugin implements Listener {
         }
         
         logger.info("AntiProtocolOverflow 插件已启用，使用ProtocolLib数据包层处理");
+        logger.info("物品处理已迁移到数据包层面，避免物品丢失风险");
+        logger.info("容器和背包物品现在通过WINDOW_ITEMS和SET_SLOT数据包进行延迟加载");
     }
 
     @Override
     public void onDisable() {
         // 清理数据包处理器
         if (packetHandler != null) {
+            packetHandler.clearAllData();
             packetHandler.unregister();
             packetHandler = null;
         }
+        
+        // 清理本类中的数据结构
+        isLoadingInventory.clear();
+        inventoryLoadProgress.clear();
+        loadedChunks.clear();
         
         logger.info("AntiProtocolOverflow 插件已禁用!");
     }
@@ -235,6 +249,17 @@ public class AntiProtocolOverflow extends JavaPlugin implements Listener {
     public void reloadConfig() {
         super.reloadConfig();
         loadConfigValues();
+        
+        // 重新初始化保护方块类型
+        protectedBlockTypes.clear();
+        initProtectedBlockTypes();
+        
+        // 更新数据包处理器中的配置
+        if (packetHandler != null) {
+            packetHandler.updateConfig(itemLoadDelay, itemsPerLoad, blockLoadDelay, 50, 
+                                      logLoadEvents, enableProtection, slowInventoryLoad, slowBlockLoad);
+            logger.info("已更新PacketHandler中的物品加载配置");
+        }
     }
 
     @EventHandler
@@ -254,108 +279,207 @@ public class AntiProtocolOverflow extends JavaPlugin implements Listener {
         
         logEvent("玩家 " + player.getName() + " 加入游戏，开始控制区块加载");
         
-        // 立即开始缓慢加载背包（不延迟），确保玩家首先看到空背包
-        if (slowInventoryLoad) {
-            startSlowInventoryLoad(player);
-        }
-        
-        // 注意：区块加载控制已迁移到PacketHandler中，不再需要这里的延迟执行
-        // 初始化玩家数据
+        // 初始化玩家数据并启用数据包层面的物品处理
         if (packetHandler != null) {
             packetHandler.initializePlayer(player);
+            
+            // 通过数据包处理器启用缓慢加载背包
+            if (slowInventoryLoad) {
+                packetHandler.markInventoryLoading(player, true);
+                logEvent("为玩家 " + player.getName() + " 启用数据包层面的背包缓慢加载");
+            }
         }
+        
+        // 注意：不再直接调用startSlowInventoryLoad，因为现在由PacketHandler通过数据包层面处理
     }
     
     // 注意：区块加载控制已迁移到PacketHandler中，不再使用此方法
     
     /**
-     * 缓慢加载玩家背包物品
+     * 缓慢加载玩家背包物品 - 现在通过数据包层面处理
      */
     private void startSlowInventoryLoad(final Player player) {
         final UUID playerId = player.getUniqueId();
-        final Inventory inventory = player.getInventory();
-        final ItemStack[] contents = inventory.getContents().clone();
         
-        // 立即标记正在加载
+        // 标记正在加载
         isLoadingInventory.put(playerId, true);
         inventoryLoadProgress.put(playerId, 0);
         
-        logEvent("开始为玩家 " + player.getName() + " 缓慢加载背包物品");
+        logEvent("通过数据包层面为玩家 " + player.getName() + " 缓慢加载背包物品");
         
-        // 在独立任务中清空背包并开始加载，确保清空操作立即执行
-        new BukkitRunnable() {
-            @Override
-            public void run() {
-                if (player.isOnline()) {
-                    // 清空玩家背包
-                    inventory.clear();
-                    logEvent("已清空玩家 " + player.getName() + " 的背包，准备开始逐个加载物品");
-                    
-                    // 开始逐个加载物品
-                    startInventoryItemsLoad(player, contents);
-                }
-            }
-        }.runTask(this); // 立即执行
+        // 注意：不再直接操作Inventory，而是通过PacketHandler在数据包层面处理
+        // 无需清空背包或手动加载物品，PacketHandler会在WINDOW_ITEMS数据包中处理
     }
     
     /**
-     * 逐个加载背包物品的方法 - 先加载快捷栏(0-8)，再加载背包其他槽位
+     * 检查物品是否为潜影盒
+     */
+    private boolean isShulkerBox(ItemStack item) {
+        if (item == null) return false;
+        return item.getType().toString().contains("SHULKER_BOX");
+    }
+    
+    /**
+     * 检查潜影盒是否为空
+     */
+    private boolean isEmptyShulkerBox(ItemStack shulkerBox) {
+        if (shulkerBox == null || !isShulkerBox(shulkerBox)) return true;
+        ItemMeta meta = shulkerBox.getItemMeta();
+        if (meta instanceof BlockStateMeta) {
+            BlockStateMeta blockStateMeta = (BlockStateMeta) meta;
+            if (blockStateMeta.hasBlockState()) {
+                BlockState blockState = blockStateMeta.getBlockState();
+                if (blockState instanceof ShulkerBox) {
+                    ShulkerBox shulkerBoxState = (ShulkerBox) blockState;
+                    return shulkerBoxState.getInventory().isEmpty();
+                }
+            }
+        }
+        return true;
+    }
+    
+    /**
+     * 获取空的潜影盒（保留原始类型）
+     */
+    private ItemStack getEmptyShulkerBox(ItemStack originalShulkerBox) {
+        if (originalShulkerBox == null || !isShulkerBox(originalShulkerBox)) return null;
+        
+        ItemStack emptyShulkerBox = new ItemStack(originalShulkerBox.getType());
+        // 复制名称和自定义数据，但不复制内容
+        ItemMeta meta = originalShulkerBox.getItemMeta();
+        if (meta != null) {
+            ItemMeta emptyMeta = emptyShulkerBox.getItemMeta();
+            if (meta.hasDisplayName()) {
+                emptyMeta.setDisplayName(meta.getDisplayName());
+            }
+            if (meta.hasLore()) {
+                emptyMeta.setLore(meta.getLore());
+            }
+            emptyShulkerBox.setItemMeta(emptyMeta);
+        }
+        return emptyShulkerBox;
+    }
+    
+    /**
+     * 加载背包物品的方法 - 一次性加载普通物品，对潜影盒进行特殊处理
      */
     private void startInventoryItemsLoad(final Player player, final ItemStack[] contents) {
         final UUID playerId = player.getUniqueId();
         final Inventory inventory = player.getInventory();
+        final int HOTBAR_SIZE = 9; // 快捷栏大小
         
-        // 创建任务逐个加载物品
-        new BukkitRunnable() {
-            int phase = 1; // 1: 快捷栏阶段, 2: 背包阶段
-            int slot = 0;
-            final int HOTBAR_SIZE = 9; // 快捷栏大小
-            
-            @Override
-            public void run() {
-                if (!player.isOnline()) {
-                    isLoadingInventory.put(playerId, false);
-                    logEvent("玩家 " + player.getName() + " 离线，停止加载背包物品");
-                    this.cancel();
-                    return;
-                }
-                
-                // 根据当前阶段加载不同槽位
-                if (phase == 1) {
-                    // 加载快捷栏 (0-8)
-                    if (slot < HOTBAR_SIZE) {
-                        if (slot < contents.length && contents[slot] != null) {
-                            inventory.setItem(slot, contents[slot]);
-                            logEvent("为玩家 " + player.getName() + " 加载快捷栏物品槽: " + slot);
+        // 用于跟踪需要加载内容的潜影盒
+        final Set<Integer> shulkerBoxSlots = new HashSet<>();
+        
+        // 第一阶段：先加载快捷栏
+        for (int i = 0; i < HOTBAR_SIZE; i++) {
+            if (contents[i] != null && contents[i].getType() != Material.AIR) {
+                if (isShulkerBox(contents[i])) {
+                    // 对于潜影盒，如果不为空，则先发送空的潜影盒
+                    if (!isEmptyShulkerBox(contents[i])) {
+                        shulkerBoxSlots.add(i);
+                        ItemStack emptyShulkerBox = getEmptyShulkerBox(contents[i]);
+                        if (emptyShulkerBox != null) {
+                            inventory.setItem(i, emptyShulkerBox);
+                            if (logLoadEvents) {
+                                logEvent("为玩家 " + player.getName() + " 放置背包快捷栏空潜影盒槽: " + i);
+                            }
                         }
-                        slot++;
                     } else {
-                        // 快捷栏加载完成，进入背包阶段
-                        phase = 2;
-                        slot = HOTBAR_SIZE; // 从快捷栏之后的槽位开始
-                        logEvent("玩家 " + player.getName() + " 快捷栏加载完成，开始加载背包物品");
+                        // 空潜影盒直接发送
+                        inventory.setItem(i, contents[i]);
+                        if (logLoadEvents) {
+                            logEvent("为玩家 " + player.getName() + " 放置背包快捷栏空潜影盒槽: " + i);
+                        }
                     }
-                } else if (phase == 2) {
-                    // 加载背包其他槽位
-                    if (slot < contents.length) {
-                        if (contents[slot] != null) {
-                            inventory.setItem(slot, contents[slot]);
-                            logEvent("为玩家 " + player.getName() + " 加载背包物品槽: " + slot);
+                } else {
+                    // 普通物品立即加载
+                    inventory.setItem(i, contents[i]);
+                    if (logLoadEvents) {
+                        logEvent("为玩家 " + player.getName() + " 放置背包快捷栏普通物品槽: " + i);
+                    }
+                }
+            }
+        }
+        
+        logEvent("玩家 " + player.getName() + " 快捷栏物品加载完成");
+        
+        // 第二阶段：加载背包其他槽位
+        for (int i = HOTBAR_SIZE; i < contents.length; i++) {
+            if (contents[i] != null && contents[i].getType() != Material.AIR) {
+                if (isShulkerBox(contents[i])) {
+                    // 对于潜影盒，如果不为空，则先发送空的潜影盒
+                    if (!isEmptyShulkerBox(contents[i])) {
+                        shulkerBoxSlots.add(i);
+                        ItemStack emptyShulkerBox = getEmptyShulkerBox(contents[i]);
+                        if (emptyShulkerBox != null) {
+                            inventory.setItem(i, emptyShulkerBox);
+                            if (logLoadEvents) {
+                                logEvent("为玩家 " + player.getName() + " 放置背包空潜影盒槽: " + i);
+                            }
                         }
-                        slot++;
                     } else {
-                        // 所有物品加载完成
+                        // 空潜影盒直接发送
+                        inventory.setItem(i, contents[i]);
+                        if (logLoadEvents) {
+                            logEvent("为玩家 " + player.getName() + " 放置背包空潜影盒槽: " + i);
+                        }
+                    }
+                } else {
+                    // 普通物品立即加载
+                    inventory.setItem(i, contents[i]);
+                    if (logLoadEvents) {
+                        logEvent("为玩家 " + player.getName() + " 放置背包普通物品槽: " + i);
+                    }
+                }
+            }
+        }
+        
+        logEvent("玩家 " + player.getName() + " 背包普通物品已加载完成");
+        
+        // 如果有潜影盒需要加载内容，则使用定时任务逐个加载
+        if (!shulkerBoxSlots.isEmpty()) {
+            logEvent("玩家 " + player.getName() + " 准备加载背包潜影盒内容");
+            
+            final Iterator<Integer> shulkerIterator = shulkerBoxSlots.iterator();
+            
+            new BukkitRunnable() {
+                @Override
+                public void run() {
+                    if (!player.isOnline()) {
                         isLoadingInventory.put(playerId, false);
-                        logEvent("玩家 " + player.getName() + " 的背包物品加载完成");
+                        logEvent("玩家 " + player.getName() + " 离线，停止加载背包潜影盒内容");
                         this.cancel();
                         return;
                     }
+                    
+                    // 每次处理一定数量的潜影盒
+                    int processedThisTick = 0;
+                    
+                    while (shulkerIterator.hasNext() && processedThisTick < itemsPerLoad) {
+                        int slot = shulkerIterator.next();
+                        inventory.setItem(slot, contents[slot]);
+                        processedThisTick++;
+                        shulkerIterator.remove();
+                        if (logLoadEvents) {
+                            logEvent("为玩家 " + player.getName() + " 加载背包潜影盒内容槽: " + slot);
+                        }
+                    }
+                    
+                    // 检查是否所有潜影盒内容加载完成
+                    if (!shulkerIterator.hasNext()) {
+                        // 标记背包加载完成
+                        isLoadingInventory.put(playerId, false);
+                        logEvent("玩家 " + player.getName() + " 的背包物品加载完成，包括所有潜影盒内容");
+                        this.cancel();
+                    }
                 }
-                
-                // 更新进度
-                inventoryLoadProgress.put(playerId, slot);
-            }
-        }.runTaskTimer(this, 0L, Math.max(3L, itemLoadDelay / 50L)); // 增加延迟至3tick，使加载过程更明显
+            }.runTaskTimer(this, Math.max(3L, itemLoadDelay / 50L), Math.max(3L, itemLoadDelay / 50L)); // 增加延迟至3tick
+        } else {
+            // 如果没有潜影盒，直接标记加载完成
+            isLoadingInventory.put(playerId, false);
+            logEvent("玩家 " + player.getName() + " 的背包物品加载完成，没有潜影盒需要特殊处理");
+        }
     }
     
     // 注意：区块加载事件现在由PacketHandler处理，不再需要这里的处理方法
@@ -401,48 +525,13 @@ public class AntiProtocolOverflow extends JavaPlugin implements Listener {
                 return;
             }
             
-            final Inventory inventory = event.getInventory();
-            final ItemStack[] contents = inventory.getContents().clone();
+            // 注意：不再直接操作服务器端Inventory对象
+            // 所有物品加载逻辑已移至PacketHandler类中通过数据包层面处理
             
-            // 标记容器正在加载
-            isLoadingContainer.put(inventory, true);
+            logEvent("玩家 " + player.getName() + " 打开了容器，数据包层面开始处理物品加载");
             
-            // 清空容器
-            inventory.clear();
-            
-            logEvent("玩家 " + player.getName() + " 打开了容器，开始缓慢加载内容");
-            
-            // 优化的容器物品加载 - 跳过空气格子，批量加载物品
-            new BukkitRunnable() {
-                int slot = 0;
-                int itemsLoadedThisTick = 0;
-                
-                @Override
-                public void run() {
-                    // 重置本tick已加载物品数
-                    itemsLoadedThisTick = 0;
-                    
-                    // 循环加载物品，直到达到本次批量加载数量或所有物品加载完成
-                    while (slot < contents.length && itemsLoadedThisTick < itemsPerLoad) {
-                        // 跳过空气格子，只加载有物品的槽位
-                        if (contents[slot] != null) {
-                            inventory.setItem(slot, contents[slot]);
-                            itemsLoadedThisTick++;
-                            logEvent("为玩家 " + player.getName() + " 加载容器物品槽: " + slot);
-                        }
-                        slot++;
-                    }
-                    
-                    // 检查是否所有物品加载完成
-                    if (slot >= contents.length) {
-                        // 标记容器加载完成
-                        isLoadingContainer.put(inventory, false);
-                        logEvent("玩家 " + player.getName() + " 的容器内容加载完成");
-                        this.cancel();
-                        return;
-                    }
-                }
-            }.runTaskTimer(this, 0L, itemLoadDelay / 50L); // 转换为tick延迟
+            // 无需清空容器或设置物品，这些都由PacketHandler在数据包层面处理
+            // PacketHandler会监听OPEN_WINDOW和WINDOW_ITEMS数据包来实现延迟加载
         }
     }
     
@@ -461,8 +550,10 @@ public class AntiProtocolOverflow extends JavaPlugin implements Listener {
             return;
         }
         
-        // 检查玩家背包是否正在加载
-        if (isLoadingInventory.containsKey(playerId) && isLoadingInventory.get(playerId)) {
+        // 检查玩家背包是否正在加载 - 使用本地变量和PacketHandler结合判断
+            boolean isLoading = Boolean.TRUE.equals(isLoadingInventory.getOrDefault(playerId, false));
+        
+        if (isLoading) {
             event.setCancelled(true);
             sendMessage(player, messageInventoryLoading);
             logEvent("阻止玩家 " + player.getName() + " 在背包加载时拾取物品");
@@ -470,7 +561,8 @@ public class AntiProtocolOverflow extends JavaPlugin implements Listener {
     }
     
     /**
-     * 阻止玩家在容器未加载完成时放入物品，并将物品返还
+     * 阻止玩家在背包未加载完成时操作物品栏
+     * 注意：容器加载状态现在由PacketHandler在数据包层面管理
      */
     @EventHandler
     public void onInventoryClick(InventoryClickEvent event) {
@@ -478,6 +570,7 @@ public class AntiProtocolOverflow extends JavaPlugin implements Listener {
         
         if (event.getWhoClicked() instanceof Player) {
             final Player player = (Player) event.getWhoClicked();
+            final UUID playerId = player.getUniqueId();
             
             // 检查是否有绕过权限
             if (player.hasPermission("antiprotocoloverflow.bypass")) {
@@ -486,41 +579,23 @@ public class AntiProtocolOverflow extends JavaPlugin implements Listener {
             
             final Inventory inventory = event.getInventory();
             final ItemStack cursorItem = event.getCursor();
+            int rawSlot = event.getRawSlot();
             
-            // 检查容器是否正在加载
-            if (isLoadingContainer.containsKey(inventory) && isLoadingContainer.get(inventory)) {
-                // 获取点击的槽位和操作类型
-                int rawSlot = event.getRawSlot();
-                int slot = event.getSlot();
-                InventoryAction action = event.getAction();
-                
-                // 检查是否是尝试放入容器的操作（包括shift点击）
-                boolean isPlaceOperation = false;
-                
-                // 处理普通放置操作
-                if (action == InventoryAction.PLACE_ALL || 
-                    action == InventoryAction.PLACE_ONE || 
-                    action == InventoryAction.PLACE_SOME || 
-                    action == InventoryAction.SWAP_WITH_CURSOR) {
-                    // 检查是否点击的是容器槽位
-                    if (rawSlot < inventory.getSize()) {
-                        isPlaceOperation = true;
-                    }
-                }
-                // 特别处理Shift+点击移动（MOVE_TO_OTHER_INVENTORY）
-                else if (action == InventoryAction.MOVE_TO_OTHER_INVENTORY) {
-                    // 对于Shift+点击，从玩家背包移动到容器
-                    // 检查点击的是否是玩家背包槽位（会导致物品移动到容器）
-                    if (rawSlot >= inventory.getSize()) {
-                        isPlaceOperation = true;
-                    }
-                }
-                
-                if (isPlaceOperation) {
+            // 检查玩家背包是否正在加载
+            boolean isLoading = false;
+            if (packetHandler != null) {
+                // 优先使用PacketHandler中的状态
+                isLoading = Boolean.TRUE.equals(this.isLoadingInventory.getOrDefault(playerId, false));
+            }
+            
+            if (isLoading) {
+                // 检查是否点击的是玩家自己的物品栏（包括主手、副手、防具栏）
+                if (inventory.equals(player.getInventory())) {
                     event.setCancelled(true);
-                    sendMessage(player, messageContainerLoading);
+                    sendMessage(player, messageInventoryLoading);
+                    logEvent("阻止玩家 " + player.getName() + " 在背包加载时操作物品栏，槽位: " + rawSlot);
                     
-                    // 确保物品返还到玩家背包
+                    // 确保物品返还
                     if (cursorItem != null && cursorItem.getType() != Material.AIR) {
                         // 尝试将物品放入玩家背包
                         Map<Integer, ItemStack> remaining = player.getInventory().addItem(cursorItem);
@@ -531,10 +606,13 @@ public class AntiProtocolOverflow extends JavaPlugin implements Listener {
                         // 清空光标物品
                         event.setCursor(null);
                     }
-                    
-                    logEvent("阻止玩家 " + player.getName() + " 在容器加载时放入物品");
+                    return; // 直接返回，避免后续检查
                 }
             }
+            
+            // 注意：容器加载状态现在由PacketHandler在数据包层面管理
+            // 不再需要直接检查isLoadingContainer
+            // 但保留基本的操作限制以确保游戏体验一致
         }
     }
 
