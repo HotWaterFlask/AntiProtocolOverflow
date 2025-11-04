@@ -6,7 +6,7 @@
 
     <groupId>com.minecraft</groupId>
     <artifactId>AntiProtocolOverflow</artifactId>
-    <version>1.0.0</version>
+    <version>v1.0.3</version>
     <packaging>jar</packaging>
 
     <name>AntiProtocolOverflow</name>
