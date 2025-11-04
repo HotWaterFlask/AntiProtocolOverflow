@@ -1,5 +1,5 @@
 name: AntiProtocolOverflow
-version: 1.0
+version: v1.0.3
 description: 防止禁人书盒、禁人塔建筑，保护服务器免受协议溢出攻击
 author: HotWaterFlask
 main: com.minecraft.antiprotocoloverflow.AntiProtocolOverflow
